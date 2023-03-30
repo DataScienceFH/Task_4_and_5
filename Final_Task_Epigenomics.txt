@@ -1,0 +1,228 @@
+##################################################################
+#       Task 4: EN-TEx ATAC-seq data: downstream analyses        #
+#                       Author: Frank Hause                      #
+##################################################################
+
+cd epigenomics_uvic/ATAC-seq
+
+# This line was included since sometimes Docker did not run as it should
+# sudo dockerd
+
+# These lines were included to clear epigenomics_uvic/ATAC-seq after a new run.
+sudo rm -R analyses annotation data
+sudo rm metadata.tsv
+
+# Create necessary directories
+mkdir analyses data annotation
+mkdir data/bigBed.files data/bed.files analyses/peaks.analysis
+
+# Download metadata file from ENCODE project website
+../bin/download.metadata.sh "https://www.encodeproject.org/metadata/?replicates.library.biosample.donor.uuid=d370683e-81e7-473f-8475-7716d027849b&status=released&status=submitted&status=in+progress&assay_title=ATAC-seq&biosample_ontology.term_name=stomach&biosample_ontology.term_name=sigmoid+colon&type=Experiment" 
+
+# Filter metadata file for bigBed narrowPeak, pseudoreplicated peaks files with genome assembly GRCh38
+grep -F "bigBed_narrowPeak" metadata.tsv |\
+grep -F "pseudoreplicated_peaks" |\
+grep -F "GRCh38" |\
+awk 'BEGIN{FS=OFS="\t"}{print $1, $11, $23}' |\
+sort -k2,2 -k1,1r |\
+sort -k2,2 -u > analyses/bigBed.ids.txt
+
+# Loop over the accession column in bigBed.ids.txt and download the corresponding bigBed file
+cut -f1 analyses/bigBed.ids.txt |\
+while read filename; do
+  wget -P data/bigBed.files "https://www.encodeproject.org/files/$filename/@@download/$filename.bigBed"
+done
+
+# Check MD5 hash sum 
+for file_type in bigBed; do
+  # retrieve original MD5 hash from the metadata
+  ../bin/selectRows.sh <(cut -f1 analyses/"$file_type".ids.txt) metadata.tsv | cut -f1,46 > data/"$file_type".files/md5sum.txt
+  # compute MD5 hash on the downloaded files 
+  cat data/"$file_type".files/md5sum.txt |\
+  while read filename original_md5sum; do 
+    md5sum data/"$file_type".files/"$filename"."$file_type" |\
+    awk -v filename="$filename" -v original_md5sum="$original_md5sum" 'BEGIN{FS=" "; OFS="\t"}{print filename, original_md5sum, $1}' 
+  done > tmp 
+  mv tmp data/"$file_type".files/md5sum.txt
+  # make sure there are no files for which original and computed MD5 hashes differ
+  awk '$2!=$3' data/"$file_type".files/md5sum.txt
+done
+
+# Download annotation
+wget -P annotation "https://www.encodeproject.org/files/gencode.v24.primary_assembly.annotation/@@download/gencode.v24.primary_assembly.annotation.gtf.gz"
+gunzip annotation/gencode.v24.primary_assembly.annotation.gtf.gz
+
+# Inspect annotation
+# less annotation/gencode.v24.primary_assembly.annotation.gtf
+
+# Reduce annotation to protein-coding genes
+awk '$3=="gene"' annotation/gencode.v24.primary_assembly.annotation.gtf |\
+grep -F "protein_coding" |\
+cut -d ";" -f1 |\
+awk 'BEGIN{OFS="\t"}{print $1, $4, $5, $10, 0, $7, $10}' |\
+sed 's/\"//g' |\
+awk 'BEGIN{FS=OFS="\t"}$1!="chrM"{$2=($2-1); print $0}' > annotation/gencode.v24.protein.coding.gene.body.bed
+
+# Inspect reduced annotation
+# less annotation/gencode.v24.protein.coding.gene.body.bed
+
+# Run Docker
+sudo docker run -v $PWD:$PWD -w $PWD --rm -it dgarrimar/epigenomics_course
+
+# Convert bigBed to bed files
+cut -f1 analyses/bigBed.ids.txt |\
+while read filename; do
+  bigBedToBed data/bigBed.files/"$filename".bigBed data/bed.files/"$filename".bed
+done
+
+# Inspect bed files
+# cut -f1 analyses/bigBed.ids.txt |\
+# while read filename; do
+#   less data/bed.files/"$filename".bed
+# done
+
+# Intersect bed files with reduced annotation
+cut -f1 analyses/bigBed.ids.txt |\
+while read filename; do
+	bedtools intersect -a data/bed.files/"$filename".bed -b annotation/gencode.v24.protein.coding.gene.body.bed -c > analyses/peaks.analysis/"$filename"_intersect.tsv
+done
+
+# Count peaks within and without gene bodies and save the result to separate files
+while read -r filename organ; do
+  awk '$NF > 0' analyses/peaks.analysis/"$filename"_intersect.tsv > analyses/peaks.analysis/"$filename"_intersect_in_genes.tsv
+  awk '$NF == 0' analyses/peaks.analysis/"$filename"_intersect.tsv > analyses/peaks.analysis/"$filename"_intersect_outside_genes.tsv
+
+  peaks_in_gene=$(wc -l < analyses/peaks.analysis/"$filename"_intersect_in_genes.tsv)
+  peaks_outside_gene=$(wc -l < analyses/peaks.analysis/"$filename"_intersect_outside_genes.tsv)
+
+  printf "In %s (%s) %d peaks intersect with gene body.\n" "$filename.bed" "$organ" "$peaks_in_gene"
+  printf "In %s (%s) %d peaks fall outside gene coordinates.\n" "$filename.bed" "$organ" "$peaks_outside_gene"
+done < analyses/bigBed.ids.txt
+
+# RESULTS:
+# In ENCFF287UHP.bed (sigmoid_colon) 73964 peaks intersect with gene body.           
+# In ENCFF287UHP.bed (sigmoid_colon) 37035 peaks fall outside gene coordinates.      
+# In ENCFF762IFP.bed (stomach) 69072 peaks intersect with gene body.                
+# In ENCFF762IFP.bed (stomach) 34537 peaks fall outside gene coordinates.
+
+exit
+
+##################################################################
+#               Task 5: Distal regulatory activity               #
+#                       Author: Frank Hause                      #
+##################################################################
+
+# Task 1: Create a folder regulatory_elements inside epigenomics_uvic. This will be the folder where you store all your subsequent results.
+
+cd ..
+# These line was included to clear epigenomics_uvic/regulatory_elements after a new run.
+sudo rm -R regulatory_elements
+mkdir regulatory_elements
+
+# Task 2: Distal regulatory regions are usually found to be flanked by both H3K27ac and H3K4me1. From your starting catalogue of open regions in each tissue, select those that overlap peaks of H3K27ac AND H3K4me1 in the corresponding tissue. You will get a list of candidate distal regulatory elements for each tissue. How many are they?
+
+cd regulatory_elements
+mkdir cand_distregs
+
+cd ../ChIP-seq/
+cut -f1 analyses/bigBed.peaks.ids.txt |\
+while read filename; do
+  cp "data/bed.files/$filename.bed" "../regulatory_elements/cand_distregs/$filename.bed"
+done
+
+cp ../ATAC-seq/analyses/peaks.analysis/ENCFF287UHP_intersect_outside_genes.tsv ../ATAC-seq/analyses/peaks.analysis/ENCFF762IFP_intersect_outside_genes.tsv ../regulatory_elements/cand_distregs/
+
+cd ../regulatory_elements/cand_distregs
+
+while read -r filename organ rest; do
+  bedtools intersect -a "${filename}.bed" \
+  -b "$(grep "$organ" ../../ChIP-seq/analyses/bigBed.peaks.ids.txt | cut -f1 | grep -v "$filename").bed" -c \
+  > "${organ}_histon_peaks_intersect.bed"
+done < ../../ChIP-seq/analyses/bigBed.peaks.ids.txt
+
+awk '$NF != 0' sigmoid_colon_histon_peaks_intersect.bed > sigmoid_colon_common_histon_peaks.bed
+awk '$NF != 0' stomach_histon_peaks_intersect.bed > stomach_common_histon_peaks.bed
+
+bedtools intersect -a ENCFF287UHP_intersect_outside_genes.tsv -b sigmoid_colon_common_histon_peaks.bed -c > sigmoid_colon_cand_dist_regs.bed
+bedtools intersect -a ENCFF762IFP_intersect_outside_genes.tsv -b stomach_common_histon_peaks.bed -c > stomach_cand_dist_regs.bed
+
+count=$(awk '$NF != 0' sigmoid_colon_cand_dist_regs.bed | wc -l)
+echo "In sigmoid colon there are ${count} combined signals of H3K4me1, H3K27ac, and ATAC-seq peaks outside of gene bodies."
+count=$(awk '$NF != 0' stomach_cand_dist_regs.bed | wc -l)
+echo "In stomach there are ${count} combined signals of H3K4me1, H3K27ac, and ATAC-seq peaks outside of gene bodies."
+
+# RESULTS:
+# In sigmoid colon there are 8,268 combined signals of H3K4me1, H3K27ac, and ATAC-seq peaks outside of gene bodies.
+# In stomach there are 6,320 combined signals of H3K4me1, H3K27ac, and ATAC-seq peaks outside of gene bodies.
+
+# Task 3: Focus on regulatory elements that are located on chromosome 1 (hint: to parse a file based on the value of a specific column, have a look at what we did here), and generate a file regulatory.elements.starts.tsv that contains the name of the regulatory region (i.e. the name of the original ATAC-seq peak) and the start (5') coordinate of the region.
+
+# COMMENT: I am not quite sure whether the task intends to keep the tissues separated, but I will do so for the following tasks (6 & 7).
+
+awk '$NF != 0 && $1 == "chr1"' sigmoid_colon_cand_dist_regs.bed > chr1_sigmoid_colon_cand_dist_regs.bed
+awk '$NF != 0 && $1 == "chr1"' stomach_cand_dist_regs.bed > chr1_stomach_cand_dist_regs.bed
+
+awk 'BEGIN{FS=OFS="\t"}{if ($1=="chr1") print $4, $2}' chr1_sigmoid_colon_cand_dist_regs.bed > regulatory.elements.starts_sigmoid.colon.tsv
+awk 'BEGIN{FS=OFS="\t"}{if ($1=="chr1") print $4, $2}' chr1_stomach_cand_dist_regs.bed > regulatory.elements.starts_stomach.tsv
+
+# Check results
+# less regulatory.elements.starts_sigmoid.colon.tsv
+# less regulatory.elements.starts_stomach.tsv
+
+# Task 4: Focus on protein-coding genes located on chromosome 1. From the BED file of gene body coordinates that you generated here, prepare a tab-separated file called gene.starts.tsv which will store the name of the gene in the first column, and the start coordinate of the gene on the second column (REMEMBER: for genes located on the minus strand, the start coordinate will be at the 3'). Use the command below as a starting point:
+# awk 'BEGIN{FS=OFS="\t"}{if ($6=="+"){start=$2} else {start=$3}; print $4, start}'
+
+awk 'BEGIN{FS=OFS="\t"}{if ($1=="chr1") {if ($6=="+"){start=$2} else {start=$3}; print $4, start}}' ../../ChIP-seq/annotation/gencode.v24.protein.coding.gene.body.bed > gene.starts.tsv
+
+# Check results
+# less gene.starts.tsv
+
+# Task 5: Download or copy this python script inside the epigenomics_uvic/bin folder. Have a look at the help page of this script to understand how it works:
+# python ../bin/get.distance.py -h
+# This script takes as input two distinct arguments: 1) --input corresponds to the file gene.starts.tsv (i.e. the file you generated in Task #4); 2) --start corresponds to the 5' coordinate of a regulatory element. Complete the python script so that for a given coordinate --start the script returns the closest gene, the start of the gene and the distance of the regulatory element.
+
+wget -P ../../bin https://public-docs.crg.es/rguigo/Data/bborsari/UVIC/epigenomics_course/get.distance.py
+
+python ../../bin/get.distance_completed.py --input gene.starts.tsv --start 980000
+
+# COMMENT: For reasons of transparency I will also upload get.distance_completed.py to the GitHub repo.
+
+# Task 6. For each regulatory element contained in the file regulatory.elements.starts.tsv, retrieve the closest gene and the distance to the closest gene using the python script you created above. Use the command below as a starting point:
+# cat regulatory.elements.starts.tsv | while read element start; do 
+#   python ../bin/get.distance.py ... # to be completed by you; 
+# done > regulatoryElements.genes.distances.tsv
+
+cat regulatory.elements.starts_sigmoid.colon.tsv | while read element start; do 
+  python ../../bin/get.distance_completed.py --input gene.starts.tsv --start "$start"
+done > regulatoryElements.genes.distances_sigmoid.colon.tsv
+
+cat regulatory.elements.starts_stomach.tsv | while read element start; do 
+  python ../../bin/get.distance_completed.py --input gene.starts.tsv --start "$start"
+done > regulatoryElements.genes.distances_stomach.tsv
+
+# Task 7: Use R to compute the mean and the median of the distances stored in regulatoryElements.genes.distances.tsv.
+
+R 
+
+data_colon <- read.table("regulatoryElements.genes.distances_sigmoid.colon.tsv", header = FALSE, col.names = c("gene", "start", "distance"))
+data_stomach <- read.table("regulatoryElements.genes.distances_stomach.tsv", header = FALSE, col.names = c("gene", "start", "distance"))
+
+mean_distance_colon <- mean(data_colon$distance)
+mean_distance_stomach <- mean(data_stomach$distance)
+
+median_distance_colon <- median(data_colon$distance)
+median_distance_stomach <- median(data_stomach$distance)
+
+cat("Mean distance in sigmoid colon:", mean_distance_colon, "\n")
+cat("Median distance in sigmoid colon:", median_distance_colon, "\n")
+
+cat("Mean distance in stomach:", mean_distance_stomach, "\n")
+cat("Median distance in stomach:", median_distance_stomach, "\n")
+
+# RESULTS:
+# Mean distance in sigmoid colon: 44,721.14
+# Median distance in sigmoid colon: 21,511
+# Mean distance in stomach: 39,101.8
+# Median distance in stomach: 18,452
+
+q()
